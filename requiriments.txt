@@ -1,6 +1,7 @@
-streamlit
-easyocr
 pymupdf
+easyocr
+streamlit
 pillow
 numpy
 pandas
+opencv-python-headless

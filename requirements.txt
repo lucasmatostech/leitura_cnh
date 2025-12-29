@@ -1,5 +1,6 @@
-streamlit
 pymupdf
 easyocr
+streamlit
 pandas
+numpy
 opencv-python-headless

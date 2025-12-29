@@ -1,55 +1,81 @@
 import streamlit as st
-import fitz
-import pytesseract
+import fitz  # PyMuPDF
 import pandas as pd
 import re
-from PIL import Image
 import numpy as np
+from paddleocr import PaddleOCR
+from PIL import Image
 
-st.set_page_config(page_title="CNH OCR Leve", layout="wide")
+st.set_page_config(page_title="CNH OCR Inteligente", layout="wide")
+st.title("Extração de Dados CNH (PaddleOCR)")
 
-def extrair_dados_leve(pdf_bytes):
-    # 1. Converte PDF para imagem
+# Cache para carregar o modelo apenas uma vez
+@st.cache_resource
+def load_ocr_model():
+    # lang='pt' ativa o suporte a português
+    return PaddleOCR(use_angle_cls=True, lang='pt', show_log=False)
+
+def extrair_dados_paddle(pdf_bytes):
+    # 1. Converter PDF para imagem
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc.load_page(0)
     pix = page.get_pixmap(matrix=fitz.Matrix(3, 3))
-    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
     
-    # 2. OCR usando Tesseract (muito mais leve que EasyOCR)
-    # config: '--psm 6' assume um bloco de texto uniforme
-    texto = pytesseract.image_to_string(img, lang='por', config='--psm 6')
+    # 2. Executar OCR
+    ocr = load_ocr_model()
+    result = ocr.ocr(img_np, cls=True)
     
-    # 3. Mineração de Dados (Lógica de busca por âncoras e padrões)
-    linhas = [l.strip() for l in texto.split('\n') if l.strip()]
-    dados = {"Nome": "", "Filiação": "", "CPF": "", "Nascimento": "", "Validade": ""}
+    # O PaddleOCR retorna uma lista de listas com [coordenadas, (texto, confiança)]
+    linhas = []
+    if result[0]:
+        for res in result[0]:
+            linhas.append(res[1][0]) # Extrai apenas o texto
+            
+    texto_completo = " ".join(linhas)
+    
+    dados = {
+        "Nome": "Não encontrado",
+        "Filiação": "",
+        "CPF": "",
+        "Nascimento": "",
+        "Validade": ""
+    }
 
+    # 3. Lógica de extração por âncoras (baseado no seu documento)
+    filiacao_nomes = []
     for i, linha in enumerate(linhas):
-        # Nome: geralmente a linha seguinte ao título "NOME"
-        if "NOME" in linha.upper() and i + 1 < len(linhas):
-            dados["Nome"] = linhas[i+1].upper()
+        l_upper = linha.upper()
         
-        # Filiação: busca as linhas após o título
-        if "FILIA" in linha.upper():
-            filiacao = []
-            if i + 1 < len(linhas): filiacao.append(linhas[i+1].upper())
-            if i + 2 < len(linhas): 
+        # Nome: o que vem após a palavra "NOME"
+        if "NOME" == l_upper and i + 1 < len(linhas):
+            dados["Nome"] = linhas[i+1].upper()
+            
+        # Filiação: o que vem após "FILIAÇÃO"
+        if "FILIA" in l_upper:
+            if i + 1 < len(linhas): filiacao_nomes.append(linhas[i+1].upper())
+            if i + 2 < len(linhas):
+                # Verifica se não é um número (evita pegar o CPF ou Registro por erro)
                 if not any(char.isdigit() for char in linhas[i+2]):
-                    filiacao.append(linhas[i+2].upper())
-            dados["Filiação"] = " / ".join(filiacao)
+                    filiacao_nomes.append(linhas[i+2].upper())
 
-    # Regex para CPF e Datas
-    cpf = re.search(r'(\d{3}[\s.,-]?\d{3}[\s.,-]?\d{3}[\s.,-]?\d{2})', texto)
-    dados["CPF"] = cpf.group(1) if cpf else ""
+    dados["Filiação"] = " / ".join(filiacao_nomes)
+
+    # Regex para padrões fixos
+    cpf_match = re.search(r'(\d{3}[\s.,-]?\d{3}[\s.,-]?\d{3}[\s.,-]?\d{2})', texto_completo)
+    dados["CPF"] = cpf_match.group(1) if cpf_match else ""
     
-    datas = re.findall(r'(\d{2}/\d{2}/\d{4})', texto)
+    datas = re.findall(r'(\d{2}/\d{2}/\d{4})', texto_completo)
     if len(datas) >= 1: dados["Nascimento"] = datas[0]
     if len(datas) >= 2: dados["Validade"] = datas[1]
 
-    return dados, img
+    return dados, Image.fromarray(img_np)
 
 # Interface
-uploader = st.file_uploader("Upload CNH (PDF)", type="pdf")
+uploader = st.file_uploader("Envie o PDF da CNH", type="pdf")
 if uploader:
-    res, img_preview = extrair_dados_leve(uploader.getvalue())
-    st.image(img_preview, use_container_width=True)
-    st.dataframe(pd.DataFrame([res]), use_container_width=True)
+    with st.spinner("Analisando documento..."):
+        res, img_view = extrair_dados_paddle(uploader.getvalue())
+        st.image(img_view, use_container_width=True)
+        st.subheader("Dados Extraídos")
+        st.dataframe(pd.DataFrame([res]), use_container_width=True)

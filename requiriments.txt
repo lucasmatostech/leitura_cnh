@@ -1,1 +1,6 @@
+streamlit
+easyocr
 pymupdf
+pillow
+numpy
+pandas

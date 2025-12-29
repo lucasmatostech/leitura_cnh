@@ -5,194 +5,118 @@ from io import BytesIO
 import numpy as np
 import pandas as pd
 import re
-import unicodedata
 import traceback
 
-st.set_page_config(page_title="CNH - OCR (EasyOCR) Frente", layout="wide")
-st.title("CNH (PDF) → OCR (EasyOCR) → DataFrame (Frente)")
-st.caption("Dica: para OCR ficar bom, use PDF/scan nítido. Processamento em memória.")
+st.set_page_config(page_title="CNH - OCR (EasyOCR) Layout Clássico", layout="wide")
+st.title("CNH (PDF) → OCR (EasyOCR) → DataFrame (layout clássico)")
 
 MAX_MB = 8
 
 # -------------------------
-# Cache do EasyOCR
+# EasyOCR cache
 # -------------------------
 @st.cache_resource
 def get_reader():
     import easyocr
-    # pt + en ajuda quando OCR confunde acentos/abreviações
     return easyocr.Reader(["pt", "en"], gpu=False)
 
 # -------------------------
 # PDF -> imagem (página 1)
 # -------------------------
-def pdf_page1_to_image(pdf_bytes: bytes, zoom: float = 2.0) -> Image.Image:
+def pdf_page_to_image(pdf_bytes: bytes, page_index: int = 0, zoom: float = 2.2) -> Image.Image:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc.load_page(0)
+    page = doc.load_page(page_index)
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
     return Image.open(BytesIO(pix.tobytes("png"))).convert("RGB")
 
 # -------------------------
-# Pré-processamento simples
+# Crop absoluto por sliders (0..1)
 # -------------------------
-def preprocess(img: Image.Image) -> Image.Image:
+def crop_abs_rel(img: Image.Image, left, top, right, bottom):
+    w, h = img.size
+    x0 = int(left * w)
+    y0 = int(top * h)
+    x1 = int(right * w)
+    y1 = int(bottom * h)
+    # garante mínimo
+    x0 = max(0, min(x0, w - 2))
+    y0 = max(0, min(y0, h - 2))
+    x1 = max(x0 + 2, min(x1, w))
+    y1 = max(y0 + 2, min(y1, h))
+    return img.crop((x0, y0, x1, y1))
+
+# -------------------------
+# Pré-processamento leve (NÃO binariza forte pra não “virar QR”)
+# -------------------------
+def prep_for_ocr(img: Image.Image) -> Image.Image:
     g = ImageOps.grayscale(img)
     g = ImageOps.autocontrast(g)
-    # binarização leve (melhora texto impresso)
-    bw = g.point(lambda x: 255 if x > 165 else 0, mode="1")
-    return bw.convert("L")
+    return g
 
 # -------------------------
-# Recorte: "Frente da CNH"
-# (metade esquerda, removendo margens)
+# Crop relativo dentro da CNH
 # -------------------------
-def crop_cnh_front(page_img: Image.Image) -> Image.Image:
-    w, h = page_img.size
-
-    # Ajuste fino: pega a metade esquerda e corta bordas.
-    # (funciona na maioria dos PDFs de CNH onde o QR fica à direita)
-    x0 = int(0.05 * w)
-    y0 = int(0.12 * h)
-    x1 = int(0.58 * w)   # corta antes do QR (direita)
-    y1 = int(0.86 * h)
-
-    return page_img.crop((x0, y0, x1, y1))
+def crop_rel(img: Image.Image, box_rel):
+    w, h = img.size
+    x0, y0, x1, y1 = box_rel
+    return img.crop((int(x0*w), int(y0*h), int(x1*w), int(y1*h)))
 
 # -------------------------
-# Normalização de texto
+# OCR helper
 # -------------------------
-def strip_accents(s: str) -> str:
-    return "".join(
-        c for c in unicodedata.normalize("NFKD", s)
-        if not unicodedata.combining(c)
-    )
-
-def norm_text(s: str) -> str:
-    s = s or ""
-    s = s.replace("\u00a0", " ")
-    s = strip_accents(s).upper()
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{2,}", "\n", s)
-    return s.strip()
+def ocr_field(reader, img: Image.Image) -> str:
+    arr = np.array(img)
+    lines = reader.readtext(arr, detail=0, paragraph=True)
+    txt = " ".join([l.strip() for l in lines if l and l.strip()])
+    return re.sub(r"\s{2,}", " ", txt).strip()
 
 def digits_only(s: str) -> str:
     return re.sub(r"\D", "", s or "")
 
-# -------------------------
-# OCR
-# -------------------------
-def ocr_image(reader, img: Image.Image) -> str:
-    arr = np.array(img)
-    lines = reader.readtext(arr, detail=0, paragraph=True)
-    return "\n".join([l.strip() for l in lines if l and l.strip()])
+def find_date(text: str):
+    m = re.search(r"(\d{2}/\d{2}/\d{4})", text or "")
+    return m.group(1) if m else None
+
+def find_cat(text: str):
+    t = (text or "").upper()
+    m = re.search(r"\b(AE|AD|AC|AB|A|B|C|D|E)\b", t)
+    return m.group(1) if m else None
 
 # -------------------------
-# Parser (focado em CNH frente)
+# ROIs (layout clássico) DENTRO do recorte da frente da CNH
+# Importante: esses valores funcionam quando o recorte-base está “certinho”
+# (só a frente, sem QR)
 # -------------------------
-def parse_front_fields(ocr_raw: str) -> dict:
-    t = norm_text(ocr_raw)
-    lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
+ROIS = {
+    "NOME":       (0.08, 0.10, 0.60, 0.20),
+    "DOC_ORG":    (0.60, 0.10, 0.98, 0.16),
+    "CPF":        (0.60, 0.16, 0.82, 0.21),
+    "DT_NASC":    (0.82, 0.16, 0.98, 0.21),
+    "FILIACAO":   (0.60, 0.21, 0.98, 0.34),
 
-    # CPF (11 dígitos)
-    cpf = None
-    mcpf = re.search(r"\b(\d{3}\.?\d{3}\.?\d{3}-?\d{2})\b", t)
-    if mcpf:
-        cpf = digits_only(mcpf.group(1))
-    else:
-        m11 = re.search(r"\b(\d{11})\b", digits_only(t))
-        cpf = m11.group(1) if m11 else None
+    "PERMISSAO":  (0.60, 0.35, 0.74, 0.40),
+    "ACC":        (0.74, 0.35, 0.86, 0.40),
+    "CATEGORIA":  (0.86, 0.35, 0.98, 0.40),
 
-    # Datas dd/mm/aaaa (vamos procurar próximas de palavras, mas com OCR zoado aceitamos fallback)
-    dates = re.findall(r"\b(\d{2}/\d{2}/\d{4})\b", t)
-    dt_nasc = None
-    dt_valid = None
-    dt_emiss = None
-    dt_1hab = None
+    "N_REGISTRO": (0.08, 0.41, 0.45, 0.46),
+    "VALIDADE":   (0.45, 0.41, 0.70, 0.46),
+    "DT_1HAB":    (0.70, 0.41, 0.98, 0.46),
 
-    # Heurísticas simples por label (tolerante a OCR)
-    joined = " | ".join(lines)
+    "OBS":        (0.08, 0.53, 0.98, 0.70),
 
-    def pick_date_near(label_keywords, max_dist=140):
-        # acha posição do label no texto "joined"
-        label_pos = None
-        for kw in label_keywords:
-            p = joined.find(kw)
-            if p != -1:
-                label_pos = p
-                break
-        if label_pos is None:
-            return None
-        best = None
-        best_dist = 10**9
-        for d in dates:
-            dp = joined.find(d)
-            if dp != -1:
-                dist = abs(dp - label_pos)
-                if dist < best_dist and dist <= max_dist:
-                    best_dist = dist
-                    best = d
-        return best
+    "LOCAL":      (0.08, 0.86, 0.72, 0.92),
+    "DT_EMISSAO": (0.72, 0.86, 0.98, 0.92),
+}
 
-    dt_nasc = pick_date_near(["NASC", "NASCIMENTO", "DATA NASC"])
-    dt_valid = pick_date_near(["VALID", "VALIDADE"])
-    dt_emiss = pick_date_near(["EMISS", "EMISSAO"])
-    dt_1hab  = pick_date_near(["HABILIT", "1A HAB", "1 HAB", "HABILITAC"])
-
-    # Registro CNH (9 a 12 dígitos)
-    registro = None
-    for ln in lines:
-        if "REGIST" in ln:
-            cand = re.findall(r"\d{9,12}", digits_only(ln))
-            if cand:
-                registro = cand[0]
-                break
-
-    # Categoria (A/B/AB/AC etc) - CNH BR normalmente A, B, AB, AC, AD, AE
-    categoria = None
-    for ln in lines:
-        if "CAT" in ln:
-            m = re.search(r"\b(AE|AD|AC|AB|A|B|C|D|E)\b", ln)
-            if m:
-                categoria = m.group(1)
-                break
-
-    # Nome: pega a “melhor linha” com letras (evita cabeçalho)
-    blacklist = ["REPUBLICA", "FEDERATIVA", "BRASIL", "MINISTERIO", "SECRETARIA", "SENATRAN", "DENATRAN", "SERPRO", "QRCODE", "QR-CODE"]
-    name_candidates = []
-    for ln in lines:
-        if any(b in ln for b in blacklist):
-            continue
-        if len(ln) < 10:
-            continue
-        if len(digits_only(ln)) >= 6:
-            continue
-        # precisa ter pelo menos 2 palavras
-        if len(ln.split()) < 2:
-            continue
-        score = sum(1 for c in ln if c.isalpha()) + len(ln.split()) * 5
-        name_candidates.append((score, ln))
-    name_candidates.sort(reverse=True)
-    nome = name_candidates[0][1] if name_candidates else None
-
-    return {
-        "NOME": nome,
-        "CPF": cpf,
-        "REGISTRO_CNH": registro,
-        "CATEGORIA": categoria,
-        "DT_NASCIMENTO": dt_nasc,
-        "DT_EMISSAO": dt_emiss,
-        "DT_VALIDADE": dt_valid,
-        "DT_1A_HABILITACAO": dt_1hab,
-    }
-
-# -------------------------
+# =========================
 # UI
-# -------------------------
+# =========================
 with st.sidebar:
-    st.header("Ajustes")
-    zoom = st.slider("Zoom do PDF", 1.4, 3.0, 2.0, 0.2)
-    show_debug = st.checkbox("Mostrar texto OCR (debug)", value=True)
-    show_crop = st.checkbox("Mostrar recorte da frente", value=True)
+    st.header("Configurações")
+    zoom = st.slider("Zoom (PDF → imagem)", 1.6, 3.2, 2.4, 0.2)
+    mode = st.radio("Modo", ["Calibração do recorte", "Extrair campos"], index=0)
+    show_rois = st.checkbox("Mostrar recortes dos campos", value=True)
+    show_debug = st.checkbox("Mostrar texto OCR por campo", value=True)
 
 pdf_file = st.file_uploader("Envie a CNH (PDF)", type=["pdf"])
 
@@ -206,47 +130,107 @@ if size_mb > MAX_MB:
     st.error(f"Arquivo muito grande ({size_mb:.2f} MB). Limite: {MAX_MB} MB.")
     st.stop()
 
-run = st.button("Executar OCR na FRENTE da CNH", type="primary", use_container_width=True)
+# Render da página 1
+page_img = pdf_page_to_image(pdf_bytes, page_index=0, zoom=zoom)
+page_prep = prep_for_ocr(page_img)
+
+# Valores default de recorte (ajuste no seu caso):
+# A ideia aqui é você enquadrar SÓ a frente (sem QR).
+if "crop" not in st.session_state:
+    st.session_state.crop = dict(left=0.04, top=0.10, right=0.62, bottom=0.92)
+
+with st.sidebar:
+    st.subheader("Recorte-base (frente da CNH)")
+    left = st.slider("Left", 0.0, 1.0, float(st.session_state.crop["left"]), 0.01)
+    top = st.slider("Top", 0.0, 1.0, float(st.session_state.crop["top"]), 0.01)
+    right = st.slider("Right", 0.0, 1.0, float(st.session_state.crop["right"]), 0.01)
+    bottom = st.slider("Bottom", 0.0, 1.0, float(st.session_state.crop["bottom"]), 0.01)
+
+    if st.button("Salvar recorte"):
+        st.session_state.crop = dict(left=left, top=top, right=right, bottom=bottom)
+
+# Recorte atual
+crop_cfg = st.session_state.crop
+front_img = crop_abs_rel(page_img, crop_cfg["left"], crop_cfg["top"], crop_cfg["right"], crop_cfg["bottom"])
+front_prep = prep_for_ocr(front_img)
+
+col1, col2 = st.columns([1, 1], gap="large")
+with col1:
+    st.subheader("Página 1 (render)")
+    st.image(page_img, use_container_width=True)
+
+with col2:
+    st.subheader("Recorte-base (frente)")
+    st.image(front_img, use_container_width=True)
+    st.caption("Ajuste os sliders até o recorte mostrar SÓ a frente (sem QR). Depois clique em **Salvar recorte**.")
+
+if mode == "Calibração do recorte":
+    st.info("Quando o recorte-base estiver certo, mude o modo para **Extrair campos**.")
+    st.stop()
+
+# =========================
+# EXTRAÇÃO
+# =========================
+run = st.button("Executar OCR (por campo)", type="primary", use_container_width=True)
+
+if not run:
+    st.stop()
 
 try:
-    page_img = pdf_page1_to_image(pdf_bytes, zoom=zoom)
-    front = crop_cnh_front(page_img)
-    front_prep = preprocess(front)
-
-    col1, col2 = st.columns([1, 1], gap="large")
-
-    with col1:
-        st.subheader("Página 1")
-        st.image(page_img, use_container_width=True)
-
-    with col2:
-        if show_crop:
-            st.subheader("Recorte: Frente da CNH")
-            st.image(front, use_container_width=True)
-
-    if not run:
-        st.info("Clique no botão para rodar o OCR.")
-        st.stop()
-
     reader = get_reader()
 
-    with st.spinner("Rodando OCR (somente na frente)..."):
-        ocr_raw = ocr_image(reader, front_prep)
+    raw = {}
+    crops = {}
+
+    for k, box in ROIS.items():
+        crop = crop_rel(front_prep, box)
+        crops[k] = crop
+        raw[k] = ocr_field(reader, crop)
+
+    # Pós-processamento
+    cpf = digits_only(raw.get("CPF"))
+    cpf = cpf if len(cpf) == 11 else None
+
+    n_reg = digits_only(raw.get("N_REGISTRO"))
+    n_reg = n_reg if len(n_reg) >= 9 else None
+
+    df = pd.DataFrame([{
+        "NOME": raw.get("NOME") or None,
+        "DOC_IDENTIDADE_ORG_UF": raw.get("DOC_ORG") or None,
+        "CPF": cpf,
+        "DT_NASCIMENTO": find_date(raw.get("DT_NASC")),
+        "FILIACAO_TEXTO": raw.get("FILIACAO") or None,
+        "PERMISSAO": raw.get("PERMISSAO") or None,
+        "ACC": raw.get("ACC") or None,
+        "CATEGORIA": find_cat(raw.get("CATEGORIA")),
+        "N_REGISTRO": n_reg,
+        "DT_VALIDADE": find_date(raw.get("VALIDADE")),
+        "DT_1A_HABILITACAO": find_date(raw.get("DT_1HAB")),
+        "OBSERVACOES": raw.get("OBS") or None,
+        "LOCAL": raw.get("LOCAL") or None,
+        "DT_EMISSAO": find_date(raw.get("DT_EMISSAO")),
+    }])
+
+    st.divider()
+
+    if show_rois:
+        st.subheader("Recortes (ROIs) – agora devem cair nos campos (não no QR)")
+        cols = st.columns(3)
+        for i, (k, img) in enumerate(crops.items()):
+            with cols[i % 3]:
+                st.image(img, caption=k, use_container_width=True)
 
     if show_debug:
-        st.subheader("Texto OCR (frente) - debug")
-        st.text_area("OCR", ocr_raw, height=220)
+        st.subheader("Texto OCR por campo (debug)")
+        st.json(raw)
 
-    fields = parse_front_fields(ocr_raw)
-    df = pd.DataFrame([fields])
-
-    st.subheader("DataFrame extraído (frente)")
+    st.subheader("DataFrame extraído")
     st.dataframe(df, use_container_width=True)
 
     st.download_button(
         "Baixar CSV",
         data=df.to_csv(index=False).encode("utf-8"),
-        file_name="cnh_frente_extraida.csv",
+        file_name="cnh_extraida_layout_classico.csv",
         mime="text/csv",
         use_container_width=True
     )

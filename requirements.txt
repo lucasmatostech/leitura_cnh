@@ -1,7 +1,6 @@
-paddlepaddle
-paddleocr
-pymupdf
 streamlit
+pymupdf
+easyocr
 pandas
-pillow
-numpy<2.0.0
+numpy
+opencv-python-headless

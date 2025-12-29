@@ -1,61 +1,55 @@
 import streamlit as st
 import fitz
+import pytesseract
 import pandas as pd
 import re
-import easyocr
-import numpy as np
 from PIL import Image
+import numpy as np
 
-st.set_page_config(page_title="Leitor CNH Pro", layout="wide")
+st.set_page_config(page_title="CNH OCR Leve", layout="wide")
 
-# Cache para evitar que o app baixe o modelo toda hora e dê erro de timeout
-@st.cache_resource
-def load_ocr():
-    return easyocr.Reader(['pt'], gpu=False)
-
-def extrair_dados(pdf_bytes):
+def extrair_dados_leve(pdf_bytes):
+    # 1. Converte PDF para imagem
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc.load_page(0)
-    pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
+    pix = page.get_pixmap(matrix=fitz.Matrix(3, 3))
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     
-    reader = load_ocr()
-    # detail=1 ajuda a encontrar o texto por proximidade (quem está abaixo de quem)
-    results = reader.readtext(np.array(img), detail=1)
+    # 2. OCR usando Tesseract (muito mais leve que EasyOCR)
+    # config: '--psm 6' assume um bloco de texto uniforme
+    texto = pytesseract.image_to_string(img, lang='por', config='--psm 6')
     
+    # 3. Mineração de Dados (Lógica de busca por âncoras e padrões)
+    linhas = [l.strip() for l in texto.split('\n') if l.strip()]
     dados = {"Nome": "", "Filiação": "", "CPF": "", "Nascimento": "", "Validade": ""}
-    texto_completo = " ".join([res[1] for res in results])
-    
-    # Lógica de proximidade para Nome e Filiação
-    filiacao_nomes = []
-    for i, res in enumerate(results):
-        txt = res[1].upper()
-        # Captura o que está imediatamente após a palavra NOME
-        if "NOME" == txt and i + 1 < len(results):
-            dados["Nome"] = results[i+1][1].strip().upper()
-        # Captura as duas linhas após FILIAÇÃO
-        if "FILIA" in txt:
-            if i + 1 < len(results): filiacao_nomes.append(results[i+1][1].strip().upper())
-            if i + 2 < len(results): filiacao_nomes.append(results[i+2][1].strip().upper())
 
-    dados["Filiação"] = " / ".join(filiacao_nomes)
+    for i, linha in enumerate(linhas):
+        # Nome: geralmente a linha seguinte ao título "NOME"
+        if "NOME" in linha.upper() and i + 1 < len(linhas):
+            dados["Nome"] = linhas[i+1].upper()
+        
+        # Filiação: busca as linhas após o título
+        if "FILIA" in linha.upper():
+            filiacao = []
+            if i + 1 < len(linhas): filiacao.append(linhas[i+1].upper())
+            if i + 2 < len(linhas): 
+                if not any(char.isdigit() for char in linhas[i+2]):
+                    filiacao.append(linhas[i+2].upper())
+            dados["Filiação"] = " / ".join(filiacao)
+
+    # Regex para CPF e Datas
+    cpf = re.search(r'(\d{3}[\s.,-]?\d{3}[\s.,-]?\d{3}[\s.,-]?\d{2})', texto)
+    dados["CPF"] = cpf.group(1) if cpf else ""
     
-    # Regex para os campos padronizados
-    cpf_match = re.search(r'(\d{3}[\s.,-]?\d{3}[\s.,-]?\d{3}[\s.,-]?\d{2})', texto_completo)
-    dados["CPF"] = cpf_match.group(1) if cpf_match else ""
-    
-    datas = re.findall(r'(\d{2}/\d{2}/\d{4})', texto_completo)
+    datas = re.findall(r'(\d{2}/\d{2}/\d{4})', texto)
     if len(datas) >= 1: dados["Nascimento"] = datas[0]
     if len(datas) >= 2: dados["Validade"] = datas[1]
 
     return dados, img
 
 # Interface
-arquivo = st.file_uploader("Suba sua CNH (PDF)", type="pdf")
-if arquivo:
-    with st.spinner("Processando..."):
-        res, img_doc = extrair_dados(arquivo.getvalue())
-        st.image(img_doc, use_container_width=True)
-        df = pd.DataFrame([res])
-        st.subheader("Resultado")
-        st.dataframe(df, use_container_width=True)
+uploader = st.file_uploader("Upload CNH (PDF)", type="pdf")
+if uploader:
+    res, img_preview = extrair_dados_leve(uploader.getvalue())
+    st.image(img_preview, use_container_width=True)
+    st.dataframe(pd.DataFrame([res]), use_container_width=True)

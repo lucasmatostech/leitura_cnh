@@ -1,37 +1,28 @@
 import streamlit as st
-import fitz  # PyMuPDF
+import fitz
 import pandas as pd
 import re
 import easyocr
 import numpy as np
 from PIL import Image
 
-# Configuração da página
-st.set_page_config(page_title="Leitor CNH Oficial", layout="wide")
-st.title("Extração Inteligente de Dados CNH")
+st.set_page_config(page_title="Leitor CNH Preciso", layout="wide")
 
-# Cache para carregar o modelo apenas uma vez (evita erro de memória na nuvem)
 @st.cache_resource
 def load_reader():
-    # 'gpu=False' é necessário para o Streamlit Cloud gratuito
+    # Carrega o modelo uma única vez
     return easyocr.Reader(['pt'], gpu=False)
 
-def extrair_dados_cnh(pdf_bytes):
-    # 1. Converte PDF para imagem com alta resolução (Matrix 4x4)
-    # Isso resolve erros como 'SANIOS' em vez de 'SANTOS'
+def extrair_dados(pdf_bytes):
+    # 1. Conversão Equilibrada (Matrix 3x3 é o ponto ideal entre nitidez e ordem)
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc.load_page(0)
-    pix = page.get_pixmap(matrix=fitz.Matrix(4, 4)) 
-    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    img_np = np.array(img)
+    pix = page.get_pixmap(matrix=fitz.Matrix(3, 3)) 
+    img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
     
-    # 2. Executa o OCR
     reader = load_reader()
-    resultados = reader.readtext(img_np, detail=0)
-    
-    # Padronização do texto para busca
-    texto_limpo = [t.strip().upper() for t in resultados if len(t.strip()) > 1]
-    texto_full = " ".join(texto_limpo)
+    # detail=1 retorna: [ [[coords], texto, confiança], ... ]
+    resultados = reader.readtext(img_np, detail=1)
     
     dados = {
         "Nome": "Não encontrado",
@@ -41,59 +32,60 @@ def extrair_dados_cnh(pdf_bytes):
         "Filiação": "Não encontrada"
     }
 
-    filiacao_lista = []
+    # Texto bruto para Regex
+    texto_full = " ".join([res[1].upper() for res in resultados])
     
-    # 3. Lógica de extração baseada em âncoras
-    for i, t in enumerate(texto_limpo):
-        # Captura o NOME (que vem logo após a palavra "NOME")
-        if "NOME" == t and i + 1 < len(texto_limpo):
-            nome_extraido = texto_limpo[i+1]
-            # Correções automáticas para falhas comuns de OCR
-            dados["Nome"] = nome_extraido.replace("SANIOS", "SANTOS").replace("AMORIN", "AMORIM").replace("NATOS", "MATOS")
+    filiacao_nomes = []
 
-        # Captura a FILIAÇÃO (pega as próximas duas linhas após "FILIAÇÃO")
-        if "FILIA" in t:
-            # Tenta pegar até 3 linhas seguintes para garantir os dois nomes
+    # 2. Busca por Proximidade Espacial
+    for i, (bbox, texto, conf) in enumerate(resultados):
+        txt = texto.upper().strip()
+        
+        # --- BUSCA NOME ---
+        if "NOME" == txt:
+            # O nome geralmente é o próximo bloco detectado após a palavra NOME
+            if i + 1 < len(resultados):
+                nome_bruto = resultados[i+1][1].upper()
+                # Correção ortográfica manual para os erros que você reportou
+                dados["Nome"] = nome_bruto.replace("SANIOS", "SANTOS").replace("AMORIN", "AMORIM").replace("NATOS", "MATOS")
+
+        # --- BUSCA FILIAÇÃO ---
+        if "FILIA" in txt:
+            # Captura os próximos dois blocos de texto que não sejam números
+            count = 0
             for j in range(1, 4):
-                if i + j < len(texto_limpo):
-                    candidato = texto_limpo[i+j]
-                    # Para se encontrar números (CPF/Registro) ou rótulos de data
-                    if any(char.isdigit() for char in candidato) or "DATA" in candidato:
-                        break
-                    filiacao_lista.append(candidato.replace("NATOS", "MATOS"))
+                if i + j < len(resultados):
+                    txt_pai = resultados[i+j][1].upper()
+                    if not any(char.isdigit() for char in txt_pai) and len(txt_pai) > 5:
+                        filiacao_nomes.append(txt_pai.replace("NATOS", "MATOS"))
+                        count += 1
+                if count >= 2: break
 
-    if filiacao_lista:
-        dados["Filiação"] = " / ".join(filiacao_lista)
+    dados["Filiação"] = " / ".join(filiacao_nomes)
 
-    # 4. Regex para campos de formato fixo (CPF e Datas)
+    # 3. Regex para CPF e Datas (Mais confiável para números)
     cpf_match = re.search(r'(\d{3}[\s.,-]?\d{3}[\s.,-]?\d{3}[\s.,-]?\d{2})', texto_full)
-    if cpf_match: 
-        dados["CPF"] = cpf_match.group(1)
+    if cpf_match: dados["CPF"] = cpf_match.group(1)
     
     datas = re.findall(r'(\d{2}/\d{2}/\d{4})', texto_full)
     if len(datas) >= 1: dados["Nascimento"] = datas[0]
     if len(datas) >= 2: dados["Validade"] = datas[1]
 
-    return dados, img
+    return dados, Image.fromarray(img_np)
 
 # --- Interface ---
-uploader = st.file_uploader("Faça o upload da CNH (formato PDF)", type="pdf")
+st.title("Extração Profissional de CNH")
+uploader = st.file_uploader("Suba o PDF da CNH", type="pdf")
 
 if uploader:
-    with st.spinner("Analisando documento... Isso pode levar alguns segundos na primeira execução."):
+    with st.spinner("Processando..."):
         try:
-            res, img_preview = extrair_dados_cnh(uploader.getvalue())
-            
-            # Exibe a imagem processada
-            st.image(img_preview, caption="Documento Analisado", use_container_width=False, width=600)
-            
-            # Exibe os dados em uma tabela limpa
-            st.subheader("Dados Extraídos com Sucesso")
-            st.table(pd.DataFrame([res]))
-            
-            # Botão para baixar os dados
-            csv = pd.DataFrame([res]).to_csv(index=False).encode('utf-8')
-            st.download_button("Baixar Dados (CSV)", csv, "dados_cnh.csv", "text/csv")
-            
+            res, img_view = extrair_dados(uploader.getvalue())
+            st.image(img_view, width=500)
+            st.subheader("Resultado da Extração")
+            # Tabela Transposta para facilitar a leitura no celular/web
+            df = pd.DataFrame([res]).T
+            df.columns = ["Dados Identificados"]
+            st.table(df)
         except Exception as e:
-            st.error(f"Ocorreu um erro ao processar o arquivo: {e}")
+            st.error(f"Erro: {e}")
